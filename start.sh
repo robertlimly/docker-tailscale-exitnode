@@ -15,6 +15,13 @@ is_true() {
     esac
 }
 
+is_false() {
+    case "${1:-}" in
+        0|false|FALSE|no|NO|off|OFF) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 require_sysctl() {
     key="$1"
     value="$2"
@@ -60,7 +67,7 @@ TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-docker-$(hostname)}"
 TAILSCALE_PORT="${TAILSCALE_PORT:-41641}"
 TAILSCALE_STATE="${TAILSCALE_STATE:-mem:}"
 TAILSCALE_HEALTH_PORT="${TAILSCALE_HEALTH_PORT:-9002}"
-TAILSCALE_USERSPACE="${TAILSCALE_USERSPACE:-false}"
+TAILSCALE_USERSPACE="${TAILSCALE_USERSPACE:-${TS_USERSPACE:-auto}}"
 TAILSCALE_UP_TIMEOUT="${TAILSCALE_UP_TIMEOUT:-60}"
 TAILSCALE_SOCKS5_SERVER="${TAILSCALE_SOCKS5_SERVER:-}"
 TAILSCALE_HTTP_PROXY="${TAILSCALE_HTTP_PROXY:-}"
@@ -68,6 +75,17 @@ TAILSCALE_OAUTH_TAGS="${TAILSCALE_OAUTH_TAGS:-${TAILSCALE_ADVERTISE_TAGS:-tag:do
 TAILSCALE_UP_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
 NETDEV="${TAILSCALE_EXIT_NODE_DEV:-$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route)}"
 NETDEV="${NETDEV:-eth0}"
+
+if is_false "$TAILSCALE_USERSPACE"; then
+    TAILSCALE_USERSPACE=false
+elif is_true "$TAILSCALE_USERSPACE"; then
+    TAILSCALE_USERSPACE=true
+elif [ -c /dev/net/tun ]; then
+    TAILSCALE_USERSPACE=false
+else
+    echo 'No /dev/net/tun found; automatically using Tailscale userspace networking mode.'
+    TAILSCALE_USERSPACE=true
+fi
 
 if is_true "$TAILSCALE_USERSPACE"; then
     echo 'Using Tailscale userspace networking mode; kernel forwarding, TUN, and iptables are not required.'
