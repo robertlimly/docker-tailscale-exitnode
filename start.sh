@@ -39,11 +39,29 @@ try_sysctl() {
     sysctl -w "${key}=${value}" >/dev/null 2>&1 || [ "$(sysctl -n "$key" 2>/dev/null || true)" = "$value" ]
 }
 
+wait_for_running() {
+    timeout="$1"
+    elapsed=0
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if /app/tailscale status --json 2>/dev/null | grep -Eq '"BackendState":[[:space:]]*"Running"'; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    echo 'Tailscale did not reach Running state before timeout.' >&2
+    /app/tailscale status 2>&1 || true
+    return 1
+}
+
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-docker-$(hostname)}"
 TAILSCALE_PORT="${TAILSCALE_PORT:-41641}"
 TAILSCALE_STATE="${TAILSCALE_STATE:-mem:}"
 TAILSCALE_HEALTH_PORT="${TAILSCALE_HEALTH_PORT:-9002}"
 TAILSCALE_USERSPACE="${TAILSCALE_USERSPACE:-false}"
+TAILSCALE_UP_TIMEOUT="${TAILSCALE_UP_TIMEOUT:-60}"
 TAILSCALE_SOCKS5_SERVER="${TAILSCALE_SOCKS5_SERVER:-}"
 TAILSCALE_HTTP_PROXY="${TAILSCALE_HTTP_PROXY:-}"
 TAILSCALE_OAUTH_TAGS="${TAILSCALE_OAUTH_TAGS:-${TAILSCALE_ADVERTISE_TAGS:-tag:docker-exit}}"
@@ -171,6 +189,7 @@ fi
 
 if [ -n "$AUTH_KEY" ]; then
     "$@"
+    wait_for_running "$TAILSCALE_UP_TIMEOUT" || exit 1
 else
     "$@" || echo 'tailscale up is waiting for interactive login; healthz will stay unhealthy'
 fi

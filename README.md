@@ -94,6 +94,7 @@ docker compose --profile userspace up -d --build tailscale-exit-userspace
 | `TAILSCALE_STATE` | `mem:` | Tailscale state location. `mem:` makes the node ephemeral. |
 | `TAILSCALE_EXIT_NODE_DEV` | default route interface | Egress interface for NAT masquerade. |
 | `TAILSCALE_USERSPACE` | `false` | Enables `tailscaled --tun=userspace-networking` for platforms without `/dev/net/tun`. |
+| `TAILSCALE_UP_TIMEOUT` | `60` | Seconds to wait for authenticated nodes to reach `Running`. |
 | `TAILSCALE_SOCKS5_SERVER` | unset | Optional SOCKS5 listen address in userspace mode, for example `0.0.0.0:1055`. |
 | `TAILSCALE_HTTP_PROXY` | unset | Optional HTTP proxy listen address in userspace mode, for example `0.0.0.0:1055`. |
 
@@ -119,3 +120,12 @@ If logs show `Read-only file system`, `Permission denied (you must be root)`, or
 kernel-mode permissions. Start it with `--cap-add=NET_ADMIN --device=/dev/net/tun`
 and the forwarding `--sysctl` flags, or use `TAILSCALE_USERSPACE=true` if your
 platform cannot expose those privileges.
+
+If logs show `policy requires hardware attestation`, your tailnet policy or auth
+key requires a TPM-backed device. Containers using `TAILSCALE_STATE=mem:` or
+userspace mode cannot satisfy that on hosts without `/dev/tpmrm0`. Use an auth
+key or ACL policy that does not require hardware attestation for this container,
+or run on a host/container runtime that exposes a compatible TPM device.
+
+Warnings about UDP buffer size in userspace mode are not fatal. They mean the
+platform will use smaller socket buffers, which can reduce throughput.

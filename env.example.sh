@@ -18,5 +18,6 @@ TAILSCALE_HOSTNAME=docker-exit
 # Optional: set to true only when the platform cannot provide /dev/net/tun or
 # NET_ADMIN. Kernel mode is preferred for a high-throughput exit node.
 # TAILSCALE_USERSPACE=true
+# TAILSCALE_UP_TIMEOUT=60
 # TAILSCALE_SOCKS5_SERVER=0.0.0.0:1055
 # TAILSCALE_HTTP_PROXY=0.0.0.0:1055
