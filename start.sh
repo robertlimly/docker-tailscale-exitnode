@@ -3,37 +3,102 @@ set -eu
 
 echo 'Starting Tailscale exit-node container...'
 
+die() {
+    printf '%s\n' "$@" >&2
+    exit 1
+}
+
+is_true() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+require_sysctl() {
+    key="$1"
+    value="$2"
+
+    if sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    current=$(sysctl -n "$key" 2>/dev/null || true)
+    if [ "$current" = "$value" ]; then
+        return 0
+    fi
+
+    die "Required sysctl ${key}=${value} is not set." \
+        "Start the container with --sysctl ${key}=${value} or set TAILSCALE_USERSPACE=true for restricted platforms."
+}
+
+try_sysctl() {
+    key="$1"
+    value="$2"
+
+    sysctl -w "${key}=${value}" >/dev/null 2>&1 || [ "$(sysctl -n "$key" 2>/dev/null || true)" = "$value" ]
+}
+
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-docker-$(hostname)}"
 TAILSCALE_PORT="${TAILSCALE_PORT:-41641}"
 TAILSCALE_STATE="${TAILSCALE_STATE:-mem:}"
 TAILSCALE_HEALTH_PORT="${TAILSCALE_HEALTH_PORT:-9002}"
+TAILSCALE_USERSPACE="${TAILSCALE_USERSPACE:-false}"
+TAILSCALE_SOCKS5_SERVER="${TAILSCALE_SOCKS5_SERVER:-}"
+TAILSCALE_HTTP_PROXY="${TAILSCALE_HTTP_PROXY:-}"
 TAILSCALE_OAUTH_TAGS="${TAILSCALE_OAUTH_TAGS:-${TAILSCALE_ADVERTISE_TAGS:-tag:docker-exit}}"
 TAILSCALE_UP_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
 NETDEV="${TAILSCALE_EXIT_NODE_DEV:-$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route)}"
 NETDEV="${NETDEV:-eth0}"
 
-modprobe xt_mark 2>/dev/null || echo 'Could not load xt_mark kernel module (continuing)'
+if is_true "$TAILSCALE_USERSPACE"; then
+    echo 'Using Tailscale userspace networking mode; kernel forwarding, TUN, and iptables are not required.'
+else
+    [ "$(id -u)" = "0" ] || die \
+        'Kernel-mode exit node requires root inside the container.' \
+        'Run the container as root or set TAILSCALE_USERSPACE=true for restricted platforms.'
 
-sysctl -w net.ipv4.ip_forward=1 >/dev/null || echo 'Could not enable IPv4 forwarding (continuing)'
-sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || echo 'Could not enable IPv6 forwarding (continuing)'
+    [ -c /dev/net/tun ] || die \
+        'Kernel-mode exit node requires /dev/net/tun, but it is missing.' \
+        'Start with --device=/dev/net/tun --cap-add=NET_ADMIN, or set TAILSCALE_USERSPACE=true for restricted platforms.'
 
-iptables -t nat -C POSTROUTING -o "$NETDEV" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o "$NETDEV" -j MASQUERADE || \
-    echo "Could not configure IPv4 masquerade on ${NETDEV} (continuing)"
-ip6tables -t nat -C POSTROUTING -o "$NETDEV" -j MASQUERADE 2>/dev/null || \
-    ip6tables -t nat -A POSTROUTING -o "$NETDEV" -j MASQUERADE || \
-    echo "Could not configure IPv6 masquerade on ${NETDEV} (continuing)"
+    modprobe xt_mark 2>/dev/null || echo 'Could not load xt_mark kernel module (continuing)'
+    require_sysctl net.ipv4.ip_forward 1
+    try_sysctl net.ipv6.conf.all.forwarding 1 || echo 'Could not enable IPv6 forwarding (continuing)'
 
-# Enable UDP GRO forwarding on the internet-facing NIC for better exit-node
-# throughput (Tailscale perf best practice; needs tailscale >=1.54 + kernel >=6.2).
-# Not persistent across restarts, but start.sh runs on every container start.
-ethtool -K "$NETDEV" rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || \
-    echo "Could not enable UDP GRO forwarding on ${NETDEV} (continuing)"
+    iptables -t nat -C POSTROUTING -o "$NETDEV" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$NETDEV" -j MASQUERADE || \
+        die "Could not configure IPv4 masquerade on ${NETDEV}." \
+            'Start with --cap-add=NET_ADMIN or --privileged, or set TAILSCALE_USERSPACE=true for restricted platforms.'
+    ip6tables -t nat -C POSTROUTING -o "$NETDEV" -j MASQUERADE 2>/dev/null || \
+        ip6tables -t nat -A POSTROUTING -o "$NETDEV" -j MASQUERADE || \
+        echo "Could not configure IPv6 masquerade on ${NETDEV} (continuing)"
 
-/app/tailscaled \
+    # Enable UDP GRO forwarding on the internet-facing NIC for better exit-node
+    # throughput (Tailscale perf best practice; needs tailscale >=1.54 + kernel >=6.2).
+    # Not persistent across restarts, but start.sh runs on every container start.
+    ethtool -K "$NETDEV" rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || \
+        echo "Could not enable UDP GRO forwarding on ${NETDEV} (continuing)"
+fi
+
+set -- /app/tailscaled \
     --verbose=1 \
     --port="${TAILSCALE_PORT}" \
-    --state="${TAILSCALE_STATE}" &
+    --state="${TAILSCALE_STATE}"
+
+if is_true "$TAILSCALE_USERSPACE"; then
+    set -- "$@" --tun=userspace-networking
+fi
+
+if [ -n "$TAILSCALE_SOCKS5_SERVER" ]; then
+    set -- "$@" --socks5-server="${TAILSCALE_SOCKS5_SERVER}"
+fi
+
+if [ -n "$TAILSCALE_HTTP_PROXY" ]; then
+    set -- "$@" --outbound-http-proxy-listen="${TAILSCALE_HTTP_PROXY}"
+fi
+
+"$@" &
 TAILSCALED_PID=$!
 
 # Serve /cgi-bin/healthz for Docker health checks or external probes.

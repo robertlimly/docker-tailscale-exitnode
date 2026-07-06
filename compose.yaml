@@ -17,3 +17,22 @@ services:
     ports:
       - "9002:9002"
       - "41641:41641/udp"
+
+  # Use this profile only on platforms that cannot provide NET_ADMIN or
+  # /dev/net/tun. Userspace mode can register as an exit node, but it proxies
+  # TCP/UDP in userspace and has different behavior/performance than kernel mode.
+  tailscale-exit-userspace:
+    profiles:
+      - userspace
+    build:
+      context: .
+    image: tailscale-exit:local
+    container_name: tailscale-exit-userspace
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TAILSCALE_USERSPACE: "true"
+    ports:
+      - "9002:9002"
+      - "41641:41641/udp"
