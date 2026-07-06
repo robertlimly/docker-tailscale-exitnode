@@ -1,0 +1,19 @@
+services:
+  tailscale-exit:
+    build:
+      context: .
+    image: tailscale-exit:local
+    container_name: tailscale-exit
+    restart: unless-stopped
+    env_file:
+      - .env
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    ports:
+      - "9002:9002"
+      - "41641:41641/udp"
