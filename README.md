@@ -8,6 +8,12 @@ required.
 The image downloads `tailscale` and `tailscaled` binaries from
 https://github.com/LiuTangLei/tailscale/releases at build time.
 
+Kernel mode is required for a normal high-throughput Linux exit node. It needs
+root, `NET_ADMIN`, `/dev/net/tun`, writable forwarding sysctls, and iptables
+access. Restricted container platforms that cannot provide those permissions can
+use `TAILSCALE_USERSPACE=true`, but userspace exit-node mode has different
+behavior and lower performance.
+
 ## Build
 
 ```bash
@@ -67,6 +73,12 @@ cp env.example.sh .env
 docker compose up -d --build
 ```
 
+For userspace mode on restricted platforms:
+
+```bash
+docker compose --profile userspace up -d --build tailscale-exit-userspace
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -81,6 +93,9 @@ docker compose up -d --build
 | `TAILSCALE_HEALTH_PORT` | `9002` | Busybox HTTP health endpoint port. |
 | `TAILSCALE_STATE` | `mem:` | Tailscale state location. `mem:` makes the node ephemeral. |
 | `TAILSCALE_EXIT_NODE_DEV` | default route interface | Egress interface for NAT masquerade. |
+| `TAILSCALE_USERSPACE` | `false` | Enables `tailscaled --tun=userspace-networking` for platforms without `/dev/net/tun`. |
+| `TAILSCALE_SOCKS5_SERVER` | unset | Optional SOCKS5 listen address in userspace mode, for example `0.0.0.0:1055`. |
+| `TAILSCALE_HTTP_PROXY` | unset | Optional HTTP proxy listen address in userspace mode, for example `0.0.0.0:1055`. |
 
 ## Health Check
 
@@ -98,3 +113,9 @@ unhealthy.
 Run this on a Linux Docker host with `/dev/net/tun` available. After the node
 appears in the Tailscale admin console, approve it as an exit node unless your
 tailnet policy auto-approves the advertised tag.
+
+If logs show `Read-only file system`, `Permission denied (you must be root)`, or
+`/dev/net/tun does not exist`, the container was started without the required
+kernel-mode permissions. Start it with `--cap-add=NET_ADMIN --device=/dev/net/tun`
+and the forwarding `--sysctl` flags, or use `TAILSCALE_USERSPACE=true` if your
+platform cannot expose those privileges.
