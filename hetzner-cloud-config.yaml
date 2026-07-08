@@ -1,0 +1,411 @@
+#cloud-config
+
+# Hetzner Cloud user data for running this repo's Tailscale exit-node setup
+# directly on a VM. Before creating the VM, set one authentication method in
+# /etc/default/tailscale-exit below, then pass this file to Hetzner as cloud-init
+# user data, for example:
+#
+#   hcloud server create --name tailscale-exit --image ubuntu-24.04 --type cx22 \
+#     --ssh-key <your-key> --user-data-from-file hetzner-cloud-config.yaml
+
+package_update: true
+package_upgrade: false
+packages:
+  - ca-certificates
+  - ethtool
+  - iproute2
+  - iptables
+  - kmod
+  - procps
+  - python3-minimal
+  - wget
+
+write_files:
+  - path: /etc/default/tailscale-exit
+    owner: root:root
+    permissions: '0600'
+    content: |
+      # Same upstream version used by this repo's Dockerfile.
+      TSVERSION="1.98.5"
+
+      # Set exactly one authentication method before creating the VM. If both are
+      # set, TAILSCALE_AUTH_KEY wins, matching start.sh in this repository.
+      TAILSCALE_AUTH_KEY=""
+      TAILSCALE_OAUTH_CLIENT_ID=""
+      TAILSCALE_OAUTH_SECRET=""
+      TAILSCALE_OAUTH_TAGS=""
+
+      # Optional settings matching the Docker environment variables.
+      TAILSCALE_HOSTNAME=""
+      TAILSCALE_ADVERTISE_TAGS=""
+      TAILSCALE_PORT="41641"
+      TAILSCALE_HEALTH_PORT="9002"
+      TAILSCALE_STATE="/var/lib/tailscale/tailscaled.state"
+      TAILSCALE_EXIT_NODE_DEV=""
+      TAILSCALE_UP_TIMEOUT="60"
+      TAILSCALE_SOCKS5_SERVER=""
+      TAILSCALE_HTTP_PROXY=""
+
+  - path: /etc/sysctl.d/99-tailscale-exit.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      net.ipv4.ip_forward = 1
+      net.ipv6.conf.all.forwarding = 1
+
+  - path: /usr/local/sbin/install-tailscale-exit
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
+
+      . /etc/default/tailscale-exit
+
+      case "$(dpkg --print-architecture)" in
+        amd64) tsarch="amd64" ;;
+        arm64) tsarch="arm64" ;;
+        *)
+          echo "Unsupported architecture: $(dpkg --print-architecture)" >&2
+          exit 1
+          ;;
+      esac
+
+      tmpdir="$(mktemp -d)"
+      trap 'rm -rf "$tmpdir"' EXIT
+
+      for bin in tailscale tailscaled; do
+        url="https://github.com/LiuTangLei/tailscale/releases/download/v${TSVERSION}/${bin}-linux-${tsarch}"
+        wget --quiet --output-document="${tmpdir}/${bin}" "$url"
+        install -m 0755 "${tmpdir}/${bin}" "/usr/local/bin/${bin}"
+      done
+
+      mkdir -p /var/run/tailscale /var/cache/tailscale /var/lib/tailscale
+
+  - path: /usr/local/sbin/tailscaled-exit
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
+
+      . /etc/default/tailscale-exit
+
+      TAILSCALE_PORT="${TAILSCALE_PORT:-41641}"
+      TAILSCALE_STATE="${TAILSCALE_STATE:-/var/lib/tailscale/tailscaled.state}"
+
+      set -- /usr/local/bin/tailscaled \
+        --verbose=1 \
+        --port="${TAILSCALE_PORT}" \
+        --state="${TAILSCALE_STATE}"
+
+      if [ -n "${TAILSCALE_SOCKS5_SERVER:-}" ]; then
+        set -- "$@" --socks5-server="${TAILSCALE_SOCKS5_SERVER}"
+      fi
+
+      if [ -n "${TAILSCALE_HTTP_PROXY:-}" ]; then
+        set -- "$@" --outbound-http-proxy-listen="${TAILSCALE_HTTP_PROXY}"
+      fi
+
+      exec "$@"
+
+  - path: /usr/local/sbin/tailscale-exit-up
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
+
+      . /etc/default/tailscale-exit
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+      die() {
+        printf '%s\n' "$@" >&2
+        exit 1
+      }
+
+      require_sysctl() {
+        key="$1"
+        value="$2"
+
+        if sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+          return 0
+        fi
+
+        current="$(sysctl -n "$key" 2>/dev/null || true)"
+        if [ "$current" = "$value" ]; then
+          return 0
+        fi
+
+        die "Required sysctl ${key}=${value} is not set."
+      }
+
+      try_sysctl() {
+        key="$1"
+        value="$2"
+
+        sysctl -w "${key}=${value}" >/dev/null 2>&1 || \
+          [ "$(sysctl -n "$key" 2>/dev/null || true)" = "$value" ]
+      }
+
+      backend_state() {
+        /usr/local/bin/tailscale status --json 2>/dev/null | \
+          sed -n 's/.*"BackendState":[[:space:]]*"\([^"]*\)".*/\1/p'
+      }
+
+      print_auth_help() {
+        state="$(backend_state || true)"
+        if [ -n "$state" ]; then
+          echo "Tailscale BackendState: ${state}" >&2
+        fi
+
+        echo 'Tailscale authentication did not complete.' >&2
+        echo 'Check these items:' >&2
+        echo '- The auth key is not expired, revoked, or already consumed as a one-off key.' >&2
+        echo '- The auth key is pre-approved, or the device is approved in the Tailscale admin console.' >&2
+        echo '- The auth key or tailnet policy does not require hardware attestation for this VM.' >&2
+        echo '- If using tags, the auth key/OAuth client is allowed to use the advertised tag.' >&2
+      }
+
+      wait_for_daemon() {
+        timeout=30
+        elapsed=0
+
+        while [ "$elapsed" -lt "$timeout" ]; do
+          if [ -S /var/run/tailscale/tailscaled.sock ]; then
+            return 0
+          fi
+          sleep 1
+          elapsed=$((elapsed + 1))
+        done
+
+        die 'tailscaled did not create its socket before timeout.'
+      }
+
+      wait_for_running() {
+        timeout="$1"
+        elapsed=0
+
+        while [ "$elapsed" -lt "$timeout" ]; do
+          if [ "$(backend_state || true)" = "Running" ]; then
+            return 0
+          fi
+          sleep 1
+          elapsed=$((elapsed + 1))
+        done
+
+        echo 'Tailscale did not reach Running state before timeout.' >&2
+        /usr/local/bin/tailscale status 2>&1 || true
+        print_auth_help
+        return 1
+      }
+
+      wait_for_daemon
+
+      TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-hetzner-$(hostname)}"
+      TAILSCALE_UP_TIMEOUT="${TAILSCALE_UP_TIMEOUT:-60}"
+      TAILSCALE_OAUTH_TAGS="${TAILSCALE_OAUTH_TAGS:-${TAILSCALE_ADVERTISE_TAGS:-tag:docker-exit}}"
+      TAILSCALE_UP_TAGS="${TAILSCALE_ADVERTISE_TAGS:-}"
+      NETDEV="${TAILSCALE_EXIT_NODE_DEV:-$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route)}"
+      NETDEV="${NETDEV:-eth0}"
+
+      modprobe tun 2>/dev/null || true
+      modprobe xt_mark 2>/dev/null || echo 'Could not load xt_mark kernel module (continuing)'
+      require_sysctl net.ipv4.ip_forward 1
+      try_sysctl net.ipv6.conf.all.forwarding 1 || echo 'Could not enable IPv6 forwarding (continuing)'
+
+      iptables -t nat -C POSTROUTING -o "$NETDEV" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$NETDEV" -j MASQUERADE || \
+        die "Could not configure IPv4 masquerade on ${NETDEV}."
+      ip6tables -t nat -C POSTROUTING -o "$NETDEV" -j MASQUERADE 2>/dev/null || \
+        ip6tables -t nat -A POSTROUTING -o "$NETDEV" -j MASQUERADE || \
+        echo "Could not configure IPv6 masquerade on ${NETDEV} (continuing)"
+
+      # Tailscale exit-node throughput best practice for Linux kernels that support it.
+      ethtool -K "$NETDEV" rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || \
+        echo "Could not enable UDP GRO forwarding on ${NETDEV} (continuing)"
+
+      AUTH_KEY=""
+      if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
+        echo 'Using TAILSCALE_AUTH_KEY authentication'
+        AUTH_KEY="$TAILSCALE_AUTH_KEY"
+      elif [ -n "${TAILSCALE_OAUTH_CLIENT_ID:-}" ] || [ -n "${TAILSCALE_OAUTH_SECRET:-}" ]; then
+        if [ -z "${TAILSCALE_OAUTH_CLIENT_ID:-}" ] || [ -z "${TAILSCALE_OAUTH_SECRET:-}" ]; then
+          echo 'TAILSCALE_OAUTH_CLIENT_ID and TAILSCALE_OAUTH_SECRET must both be set'
+          exit 1
+        fi
+
+        echo 'Using OAuth client to generate an auth key'
+        if ! OAUTH_TOKEN_RESPONSE="$(wget --quiet --output-document=- --header="Content-Type: application/x-www-form-urlencoded" \
+          --post-data="client_id=${TAILSCALE_OAUTH_CLIENT_ID}&client_secret=${TAILSCALE_OAUTH_SECRET}" \
+          https://api.tailscale.com/api/v2/oauth/token)"; then
+          echo 'Failed to get access token from Tailscale API'
+          exit 1
+        fi
+
+        ACCESS_TOKEN="$(printf '%s' "$OAUTH_TOKEN_RESPONSE" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)"
+
+        if [ -z "$ACCESS_TOKEN" ]; then
+          echo 'Failed to get access token from Tailscale API'
+          exit 1
+        fi
+
+        OAUTH_TAGS_CSV="$(printf '%s' "$TAILSCALE_OAUTH_TAGS" | tr -d ' ')"
+        OAUTH_TAGS_JSON="$(printf '%s' "$OAUTH_TAGS_CSV" | sed 's/,/","/g; s/^/"/; s/$/"/')"
+        AUTH_KEY_REQUEST="$(printf '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":[%s]}}}}' "$OAUTH_TAGS_JSON")"
+
+        if ! AUTH_KEY_RESPONSE="$(wget --quiet --output-document=- --header="Content-Type: application/json" \
+          --header="Authorization: Bearer ${ACCESS_TOKEN}" \
+          --post-data="$AUTH_KEY_REQUEST" \
+          https://api.tailscale.com/api/v2/tailnet/-/keys)"; then
+          echo 'Failed to generate auth key from Tailscale API'
+          exit 1
+        fi
+
+        AUTH_KEY="$(printf '%s' "$AUTH_KEY_RESPONSE" | grep -o '"key":"[^"]*' | cut -d'"' -f4)"
+
+        if [ -z "$AUTH_KEY" ]; then
+          echo 'Failed to generate auth key from Tailscale API'
+          exit 1
+        fi
+
+        if [ -z "$TAILSCALE_UP_TAGS" ]; then
+          TAILSCALE_UP_TAGS="$OAUTH_TAGS_CSV"
+        fi
+
+        echo 'Successfully generated auth key using OAuth'
+      else
+        echo 'No Tailscale auth environment variables set; starting unauthenticated'
+      fi
+
+      set -- /usr/local/bin/tailscale up \
+        --hostname="${TAILSCALE_HOSTNAME}" \
+        --advertise-exit-node
+
+      if [ -n "$AUTH_KEY" ]; then
+        set -- "$@" --auth-key="${AUTH_KEY}"
+      fi
+
+      if [ -n "$TAILSCALE_UP_TAGS" ]; then
+        set -- "$@" --advertise-tags="${TAILSCALE_UP_TAGS}"
+      fi
+
+      if [ -n "$AUTH_KEY" ]; then
+        if "$@"; then
+          wait_for_running "$TAILSCALE_UP_TIMEOUT" || exit 1
+        else
+          code="$?"
+          echo "tailscale up failed with exit code ${code}." >&2
+          print_auth_help
+          exit "$code"
+        fi
+      else
+        "$@" || echo 'tailscale up is waiting for interactive login; healthz will stay unhealthy'
+      fi
+
+      echo "Tailscale started as ${TAILSCALE_HOSTNAME}."
+
+  - path: /usr/local/bin/tailscale-healthz
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      import http.server
+      import json
+      import os
+      import subprocess
+
+      port = int(os.environ.get("TAILSCALE_HEALTH_PORT", "9002"))
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              if self.path not in ("/", "/healthz", "/cgi-bin/healthz"):
+                  self.send_response(404)
+                  self.end_headers()
+                  return
+
+              try:
+                  raw = subprocess.check_output(
+                      ["/usr/local/bin/tailscale", "status", "--json"],
+                      stderr=subprocess.DEVNULL,
+                      timeout=2,
+                  )
+                  running = json.loads(raw).get("BackendState") == "Running"
+              except Exception:
+                  running = False
+
+              body = b"ok\n" if running else b"unhealthy\n"
+              self.send_response(200 if running else 503)
+              self.send_header("Content-Type", "text/plain")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, fmt, *args):
+              return
+
+      http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+  - path: /etc/systemd/system/tailscaled.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Tailscale node agent
+      Documentation=https://tailscale.com/kb/
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      ExecStart=/usr/local/sbin/tailscaled-exit
+      Restart=on-failure
+      RestartSec=5s
+      RuntimeDirectory=tailscale
+      StateDirectory=tailscale
+      CacheDirectory=tailscale
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/tailscale-exit-up.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Configure Tailscale as an exit node
+      Requires=tailscaled.service
+      After=tailscaled.service network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/tailscale-exit-up
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/tailscale-healthz.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Tailscale exit-node health endpoint
+      Requires=tailscaled.service
+      After=tailscaled.service
+
+      [Service]
+      EnvironmentFile=-/etc/default/tailscale-exit
+      ExecStart=/usr/local/bin/tailscale-healthz
+      Restart=always
+      RestartSec=5s
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [sysctl, --system]
+  - [/usr/local/sbin/install-tailscale-exit]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, tailscaled.service]
+  - [systemctl, enable, --now, tailscale-exit-up.service]
+  - [systemctl, enable, --now, tailscale-healthz.service]
